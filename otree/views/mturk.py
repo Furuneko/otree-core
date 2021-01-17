@@ -27,6 +27,8 @@ except ImportError:
 
 logger = logging.getLogger('otree')
 
+MAX_ASSIGNMENTS = 9
+
 
 @dataclass
 class MTurkSettings:
@@ -86,7 +88,6 @@ def in_public_domain(request):
 
 
 class MTurkCreateHIT(AdminSessionPageMixin, vanilla.FormView):
-
     # make these class attributes so they can be mocked
     aws_keys_exist = bool(
         getattr(settings, 'AWS_ACCESS_KEY_ID', None)
@@ -149,17 +150,17 @@ class MTurkCreateHIT(AdminSessionPageMixin, vanilla.FormView):
         )
 
         mturk_hit_parameters = {
-            'Title': mturk_settings.title,
-            'Description': mturk_settings.description,
-            'Keywords': keywords,
-            'MaxAssignments': session.mturk_num_workers(),
-            'Reward': str(float(session.config['participation_fee'])),
+            'Title':                       mturk_settings.title,
+            'Description':                 mturk_settings.description,
+            'Keywords':                    keywords,
+            'MaxAssignments':              MAX_ASSIGNMENTS,
+            'Reward':                      str(float(session.config['participation_fee'])),
             'AssignmentDurationInSeconds': 60
-            * mturk_settings.minutes_allotted_per_assignment,
-            'LifetimeInSeconds': int(60 * 60 * mturk_settings.expiration_hours),
-            # prevent duplicate HITs
-            'UniqueRequestToken': 'otree_{}'.format(session.code),
-            'Question': html_question,
+                                           * mturk_settings.minutes_allotted_per_assignment,
+            'LifetimeInSeconds':           int(60 * 60 * mturk_settings.expiration_hours),
+            'Question':                    html_question,
+            # Parameter currently unused
+            'RequesterAnnotation':         f'otree_annotation_{session.code}',
         }
 
         if not use_sandbox:
@@ -170,16 +171,63 @@ class MTurkCreateHIT(AdminSessionPageMixin, vanilla.FormView):
 
         with MTurkClient(use_sandbox=use_sandbox, request=request) as mturk_client:
 
-            hit = mturk_client.create_hit(**mturk_hit_parameters)['HIT']
+            mturk_num_workers = session.mturk_num_workers()
+            num_hits = mturk_num_workers // MAX_ASSIGNMENTS
+            assignments_extra = mturk_num_workers % MAX_ASSIGNMENTS
+            if assignments_extra > 0:
+                num_hits += 1
 
-            session.mturk_HITId = hit['HITId']
-            session.mturk_HITGroupId = hit['HITGroupId']
-            session.mturk_use_sandbox = use_sandbox
-            session.mturk_expiration = hit['Expiration'].timestamp()
-            session.mturk_qual_id = mturk_settings.grant_qualification_id or ''
+            hits_ids = list()
+
+            for n in range(num_hits):
+                # prevent duplicate HITs
+                mturk_hit_parameters.update(UniqueRequestToken='otree_{}_{}'.format(session.code, n))
+                if assignments_extra > 0 and n == num_hits - 1:
+                    mturk_hit_parameters.update(
+                        MaxAssignments=assignments_extra,
+                        UniqueRequestToken='otree_{}_{}'.format(session.code, 'extra')
+                    )
+                hit = mturk_client.create_hit(**mturk_hit_parameters)['HIT']
+
+                hits_ids.append(hit['HITId'])
+
+                if n == 0:
+                    session.mturk_HITGroupId = hit['HITGroupId']
+                    session.mturk_use_sandbox = use_sandbox
+                    session.mturk_expiration = hit['Expiration'].timestamp()
+                    session.mturk_qual_id = mturk_settings.grant_qualification_id or ''
+                    session.save()
+
+            session.mturk_HITId = json.dumps(hits_ids)
             session.save()
 
         return redirect('MTurkCreateHIT', session.code)
+
+
+# Method currently unused
+def get_all_hits_ids(mturk_client):
+    # Accumulate all relevant HITs IDs, one page of results at
+    # a time.
+    hits_ids = []
+
+    args = dict(
+        # i think 100 is the max page size
+        MaxResults=100,
+    )
+
+    while True:
+        response = mturk_client.list_hits(**args)
+        if not response['HITs']:
+            break
+        for h in response['HITs']:
+            hits_ids.append(h['HITId'])
+        args['NextToken'] = response['NextToken']
+
+    return hits_ids
+
+
+def get_all_hits_ids_from_db(session):
+    return json.loads(session.mturk_HITId)
 
 
 Assignment = namedtuple(
@@ -187,32 +235,33 @@ Assignment = namedtuple(
 )
 
 
-def get_all_assignments(mturk_client, hit_id) -> List[Assignment]:
+def get_all_assignments(mturk_client, hits_ids) -> List[Assignment]:
     # Accumulate all relevant assignments, one page of results at
     # a time.
     assignments = []
 
     args = dict(
-        HITId=hit_id,
         # i think 100 is the max page size
         MaxResults=100,
         AssignmentStatuses=['Submitted', 'Approved', 'Rejected'],
     )
-
-    while True:
-        response = mturk_client.list_assignments_for_hit(**args)
-        if not response['Assignments']:
-            break
-        for d in response['Assignments']:
-            assignments.append(
-                Assignment(
-                    worker_id=d['WorkerId'],
-                    assignment_id=d['AssignmentId'],
-                    status=d['AssignmentStatus'],
-                    answer=d['Answer'],
+    for hit_id in hits_ids:
+        args.update(HITId=hit_id)
+        args.pop('NextToken', None)
+        while True:
+            response = mturk_client.list_assignments_for_hit(**args)
+            if not response['Assignments']:
+                break
+            for d in response['Assignments']:
+                assignments.append(
+                    Assignment(
+                        worker_id=d['WorkerId'],
+                        assignment_id=d['AssignmentId'],
+                        status=d['AssignmentStatus'],
+                        answer=d['Answer'],
+                    )
                 )
-            )
-        args['NextToken'] = response['NextToken']
+            args['NextToken'] = response['NextToken']
 
     return assignments
 
@@ -226,17 +275,28 @@ def get_workers_by_status(
     return workers_by_status
 
 
+def get_hits_ids(mturk_client, session):
+    hits = mturk_client.list_hits()['HITs']
+    hits_ids = list()
+    for h in hits:
+        if h['RequesterAnnotation'] == f'otree_annotation_{session.code}':
+            hits_ids.append(h['HITId'])
+    return hits_ids
+
+
 class MTurkSessionPayments(AdminSessionPageMixin, vanilla.TemplateView):
     def vars_for_template(self):
         session = self.session
         published = bool(session.mturk_HITId)
         if not published:
-            return dict(published=False)
+            return dict(published=False, hitid=session.mturk_HITId)
+
+        hits_ids = get_all_hits_ids_from_db(session)
 
         with MTurkClient(
             use_sandbox=session.mturk_use_sandbox, request=self.request
         ) as mturk_client:
-            all_assignments = get_all_assignments(mturk_client, session.mturk_HITId)
+            all_assignments = get_all_assignments(mturk_client, hits_ids)
 
             # auto-reject logic
             assignment_ids_in_db = session.participant_set.exclude(
@@ -275,6 +335,7 @@ class MTurkSessionPayments(AdminSessionPageMixin, vanilla.TemplateView):
 
         return dict(
             published=True,
+            hits_ids=", ".join(hits_ids),
             participants_approved=participants_approved,
             participants_rejected=participants_rejected,
             participants_not_reviewed=participants_not_reviewed,
@@ -401,16 +462,18 @@ class MTurkExpireHIT(vanilla.View):
 
     def post(self, request, session_code):
         session = get_object_or_404(Session, code=session_code)
+        hits_ids = get_all_hits_ids_from_db(session)
         with MTurkClient(
             use_sandbox=session.mturk_use_sandbox, request=request
         ) as mturk_client:
             expiration = datetime(2015, 1, 1)
-            mturk_client.update_expiration_for_hit(
-                HITId=session.mturk_HITId,
-                # If you update it to a time in the past,
-                # the HIT will be immediately expired.
-                ExpireAt=expiration,
-            )
+            for HITId in hits_ids:
+                mturk_client.update_expiration_for_hit(
+                    HITId=HITId,
+                    # If you update it to a time in the past,
+                    # the HIT will be immediately expired.
+                    ExpireAt=expiration,
+                )
             session.mturk_expiration = expiration.timestamp()
             session.save()
 

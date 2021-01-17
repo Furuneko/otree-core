@@ -48,17 +48,16 @@ class Session(models.OTreeModel, models.VarsMixin, SessionIDMapMixin):
         doc="Randomly generated unique identifier for the session.",
     )
 
-    mturk_HITId = models.CharField(
-        max_length=300,
+    mturk_HITId = models.TextField(
         null=True,
         blank=True,
-        help_text='Hit id for this session on MTurk',
+        help_text='List of Hits ids for this session on MTurk',
     )
     mturk_HITGroupId = models.CharField(
         max_length=300,
         null=True,
         blank=True,
-        help_text='Hit id for this session on MTurk',
+        help_text='Group Hit id for this session on MTurk',
     )
     is_mturk = models.BooleanField(default=False)
 
